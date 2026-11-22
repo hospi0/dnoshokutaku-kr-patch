@@ -43,11 +43,13 @@ def to_rgb(d, w):
     return np.stack([(a & 31) << 3, ((a >> 5) & 31) << 3, ((a >> 10) & 31) << 3], -1).astype(np.uint8), a
 
 
-def to_dg2(rgb, orig_words):
+def to_dg2(rgb, orig_words, transparent=None):
     r, g, b = (rgb[..., 0].astype(np.uint16) >> 3), (rgb[..., 1].astype(np.uint16) >> 3), (rgb[..., 2].astype(np.uint16) >> 3)
     w = (0x8000 | (b << 10) | (g << 5) | r).astype('>u2')
     same = (rgb >> 3 == np.stack([orig_words & 31, (orig_words >> 5) & 31, (orig_words >> 10) & 31], -1)).all(-1)
     w[same] = orig_words[same]                    # 안 바뀐 칸은 원래 낱말 그대로(최상위 비트 포함)
+    if transparent is not None:
+        w[transparent] = 0                        # 0x0000 = 투명(엔딩 인사는 양피지 위에 겹쳐 찍힘 — 하스피 스샷 «뒷판» 2026-11-22)
     return w.tobytes()
 
 
@@ -160,6 +162,9 @@ def line_hi(text, font_path, px, shear):
     return a[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
 
 
+MES_ALPHA = {}
+
+
 def mes_img(lines, w, h):
     """엔딩 인사 — 크게(SS 배) 그려 얇은 흰 테두리(OUTLINE 화소)를 큰 그림에서 두르고 줄여서 매끄럽게(하스피 «거칠다·테두리 줄여»)"""
     n = len(lines); LH = min(16, (h - 4) // n)
@@ -179,9 +184,14 @@ def mes_img(lines, w, h):
     def down(m):
         return m.reshape(h, SS, w, SS).mean((1, 3)).astype(np.float32)
     ce, we, bb = down(core), down(wh), down(be)
+    cov = bb + we + ce                            # 덮는 비율(겹치지 않는 세 층)
     rgb = (np.array((200, 176, 128), np.float32) * bb[..., None] + np.array((248, 248, 240), np.float32) * we[..., None]
            + np.array((16, 16, 16), np.float32) * ce[..., None])   # 속 = 검정(원본처럼 — 하스피 «원본은 글자가 검은색»)
-    return np.clip(rgb + 0.5, 0, 255).astype(np.uint8)
+    rgb = rgb / np.maximum(cov, 1e-6)[..., None]  # 검정 바탕과 섞지 않은 색(바탕은 투명이라 섞으면 어두운 테가 생김)
+    rgb = np.clip(rgb + 0.5, 0, 255).astype(np.uint8)
+    MES_ALPHA['last'] = cov >= 0.5
+    rgb[cov < 0.5] = 0
+    return rgb
 
 
 def main():
@@ -193,13 +203,13 @@ def main():
     jobs = [(n, disc, 288, 176, panel_text(P, lines, n)) for n, (disc, lines) in PANELS.items()]
     for n, lines in MES.items():
         d = load(2, n); h = len(d) // 2 // 224
-        jobs.append((n, 2, 224, h, mes_img(lines, 224, h)))
+        jobs.append((n, 2, 224, h, mes_img(lines, 224, h))); MES_ALPHA[n] = MES_ALPHA.pop('last')
     for n, disc, w, h, rgb in jobs:
         orig, words = to_rgb(load(disc, n), w)
         if n in PANELS:                               # 글자 자리(원래 글자 + 새 글자, 1px 넓힘)만 바꿈 — 나머지 바탕은 원본 그대로
             reg = text_mask(orig) | dilate((rgb.astype(int) != P.astype(int)).any(-1), 2)
             rgb = np.where(reg[..., None], rgb, orig)
-        data = to_dg2(rgb, words)
+        data = to_dg2(rgb, words, ~MES_ALPHA[n] if n in MES_ALPHA else None)
         assert len(data) == w * h * 2
         p = os.path.join(out, 'disc%d' % disc); os.makedirs(p, exist_ok=True)
         open(os.path.join(p, n + '.DG2'), 'wb').write(data)
